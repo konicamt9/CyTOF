@@ -1,0 +1,100 @@
+library(flowCore)        # For reading FCS files
+library(CATALYST)        # Main package for mass cytometry preprocessing
+library(SingleCellExperiment) # Data handling framework
+library(scater)          # Visualization
+library(clusterExperiment) # Clustering
+library(dplyr)           # Data manipulation
+
+setwd("C:/Users/annab/Desktop/Andy/Rash vs NR 2025")
+
+#Data import 
+files <- list.files("./J0_Rash vs NR sezary/", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs <- read.flowSet(path = "C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/", 
+                   pattern = ".fcs", 
+                   truncate_max_range = FALSE)
+
+#prepare metadata
+metadata <- data.frame(
+  file_name = basename(files),
+  sample_id = c("NR1", "NR2", "RASH1", "NR3", "NR4", "NR5", "NR6", "NR7", 
+                "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
+                "RASH6", "RASH7", "RASH8"),
+  patient_id = c("NR1", "NR2", "RASH1", "NR3", "NR4", "NR5", "NR6", "NR7", 
+  "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
+  "RASH6", "RASH7", "RASH8"),
+   condition = c( "NR", "NR", "RASH", "NR", "NR", "NR", "NR", "NR", 
+                 "RASH", "RASH", "RASH", "NR", "NR", "RASH", "NR", 
+                 "RASH", "RASH", "RASH"),
+  stringsAsFactors = FALSE
+)
+
+#import panel used
+panel <- read.csv("C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/cytometry_panel.csv")
+
+# Import the FCS files and create a SingleCellExperiment object
+sce <- CATALYST::prepData(
+     x = fs,                # FlowSet object
+     md = metadata,         # Metadata table
+     panel = panel,         # Panel table
+     transform = TRUE,      # Perform arcsinh transformation
+     cofactor = 150,          # Specify cofactor for transformation
+     truncate_max_range = FALSE  # Prevent truncation
+)
+
+# QC
+CATALYST::pbMDS(sce, color_by = "condition")  # Multi-dimensional scaling (MDS)
+CATALYST::filterSCE(sce, exprs_values = "exprs")
+
+#UMAP 
+sce <- CATALYST::runDR(
+  x = sce,
+  dr = "UMAP",           # Options: "UMAP" or "TSNE"
+  features = "type"      # Use type markers for dimensionality reduction
+)
+
+## plot UMAP 
+CATALYST::plotDR(
+  sce,
+  color_by = "condition",  # Color cells by experimental condition
+  facet_by = "sample_id")   # Optional: separate by sample
+
+set.seed(1234)
+#clustering 
+sce <- cluster(sce, 
+               features = "type", 
+               xdim = 10, 
+               ydim = 10, 
+               maxK = 15, 
+               seed = 1234) 
+
+CATALYST::plotDR(
+     sce,
+     color_by = "cluster_id"  # Color by cluster ID
+)
+
+#check clusters expressions 
+plotExprHeatmap(sce, features = "type", 
+                 by = "cluster_id", k = "meta25", 
+                 bars = TRUE, perc = TRUE)
+plotClusterExprs(sce, k = "meta50", features = "type")
+
+# Differential analysis 
+# Perform differential abundance analysis
+da_res <- diffcyt::testDA_voom(
+  sce,
+  design = ~condition,      # Design matrix with experimental conditions
+  contrast = c("conditionTreatment - conditionControl")  # Test contrast
+)
+
+# View results
+head(da_res)
+
+# Heatmap 
+CATALYST::plotExprHeatmap(
+  sce,
+  features = "type",   # Show type markers
+  by = "cluster_id",   # Summarize by cluster
+  scale = "last"       # Scale marker expression
+)
