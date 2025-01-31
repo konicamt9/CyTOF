@@ -1,17 +1,21 @@
+#selection of markers 
+
 library(flowCore)        # For reading FCS files
 library(CATALYST)        # Main package for mass cytometry preprocessing
 library(SingleCellExperiment) # Data handling framework
 library(scater)          # Visualization
 library(clusterExperiment) # Clustering
-library(dplyr)           # Data manipulation
+library(dplyr)    # Data manipulation
+library(ggplot2)
+library(flowVS) #transformation 
 
 setwd("C:/Users/annab/Desktop/Andy/Rash vs NR 2025")
 
 #Data import 
-files <- list.files("./J0_Rash vs NR sezary/", 
+files <- list.files("./J0_Rash vs NR sezary/01_data/02_transformed", 
                     pattern = "fcs", 
                     full.names = TRUE)
-fs <- read.flowSet(path = "C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/", 
+fs <- read.flowSet(path = "C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/01_data/02_transformed", 
                    pattern = ".fcs", 
                    truncate_max_range = FALSE)
 
@@ -22,9 +26,9 @@ metadata <- data.frame(
                 "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
                 "RASH6", "RASH7", "RASH8"),
   patient_id = c("NR1", "NR2", "RASH1", "NR3", "NR4", "NR5", "NR6", "NR7", 
-  "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
-  "RASH6", "RASH7", "RASH8"),
-   condition = c( "NR", "NR", "RASH", "NR", "NR", "NR", "NR", "NR", 
+                 "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
+                 "RASH6", "RASH7", "RASH8"),
+  condition = c( "NR", "NR", "RASH", "NR", "NR", "NR", "NR", "NR", 
                  "RASH", "RASH", "RASH", "NR", "NR", "RASH", "NR", 
                  "RASH", "RASH", "RASH"),
   stringsAsFactors = FALSE
@@ -32,69 +36,91 @@ metadata <- data.frame(
 
 #import panel used
 panel <- read.csv("C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/cytometry_panel.csv")
+panel_2 <- read.csv("C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/cytometry_panel_2.csv")
 
 # Import the FCS files and create a SingleCellExperiment object
 sce <- CATALYST::prepData(
-     x = fs,                # FlowSet object
-     md = metadata,         # Metadata table
-     panel = panel,         # Panel table
-     transform = TRUE,      # Perform arcsinh transformation
-     cofactor = 150,          # Specify cofactor for transformation
-     truncate_max_range = FALSE  # Prevent truncation
+  x = fs,
+  md = metadata,
+  panel = panel_2,
+  transform = FALSE,  # Since the data is pre-transformed
+  cofactor = NULL,    # Skip additional transformation
+  assay = "exprs",    # Store data in the correct assay
+  truncate_max_range = FALSE
 )
 
-# QC
-CATALYST::pbMDS(sce, color_by = "condition")  # Multi-dimensional scaling (MDS)
-CATALYST::filterSCE(sce, exprs_values = "exprs")
+# Normalization of cells between samples 
+#Vérifier le nombre de cellules par échantillon
+table(n_cells(sce))
+# 1. Choisir le nombre de cellules à normaliser 
+#(ici, on prend le minimum entre les échantillons pour éviter de perdre trop de données)
+n_cells_to_keep <- min(n_cells(sce))
+# 2. Downsampling par échantillon
+cells_to_keep <- unlist(lapply(unique(sce$sample_id), function(sample) {
+  # Obtenir les cellules de l’échantillon en question
+  sample_cells <- which(sce$sample_id == sample)
+  # Downsampling aléatoire de n_cells_to_keep cellules
+  sample(sample_cells, size = n_cells_to_keep, replace = FALSE)
+}))
+# 3. Filtrer les cellules pour conserver la même taille dans chaque échantillon
+sce <- sce[, cells_to_keep]
+# 4. Vérification
+table(n_cells(sce))
 
-#UMAP 
-sce <- CATALYST::runDR(
-  x = sce,
-  dr = "UMAP",           # Options: "UMAP" or "TSNE"
-  features = "type"      # Use type markers for dimensionality reduction
-)
+assayNames(sce)[1] <- "exprs"  # Rename counts to exprs
+
+#optional : select high variance markers 
+expr_matrix <- assay(sce, "exprs")  # Extract expression data
+marker_variance <- apply(expr_matrix, 1, var)
+high_var_markers <- sort(marker_variance, decreasing = TRUE)[1:26]
+high_var_markers <- names(sort(marker_variance, decreasing = TRUE)[1:20])  #exclude low variance markers 
+
+#advised : filter markers (retrieve gating markers)
+type_markers <- panel$antigen[panel$marker_class == "type"]
+# Exclude CD7, CD26, and TRCB1
+type_markers_filtered <- setdiff(type_markers, c("CD8", "CD7", "CD26", "TRCB1", "CD45", "CCR10"))
+
+#trying smthg else : highvariance markers, but without gating markers 
+highvar_markers_filtered <- setdiff(high_var_markers, c("CD8", "CD7", "CD26", "TRCB1", "CD45", "CCR10"))
+
+set.seed(1234)
+#Dimensionality reduction
+sce <- runDR(sce, "UMAP", cells = 1e5, features = highvar_markers_filtered)
 
 ## plot UMAP 
 CATALYST::plotDR(
   sce,
-  color_by = "condition",  # Color cells by experimental condition
-  facet_by = "sample_id")   # Optional: separate by sample
+  color_by = "condition")   # Color cells by experimental condition
 
-set.seed(1234)
-#clustering 
+CATALYST::plotDR(
+  sce,
+  color_by = "sample_id")   # Color cells by sample id 
+
+
+# clustering 
 sce <- cluster(sce, 
-               features = "type", 
+               features = highvar_markers_filtered, 
                xdim = 10, 
                ydim = 10, 
-               maxK = 15, 
+               maxK = 10, 
                seed = 1234) 
 
 CATALYST::plotDR(
-     sce,
-     color_by = "cluster_id"  # Color by cluster ID
+  sce,
+  color_by = "meta10"  # Color by cluster ID
+)
+
+CATALYST::plotDR(
+  sce,
+  color_by = "CCR8"
 )
 
 #check clusters expressions 
-plotExprHeatmap(sce, features = "type", 
-                 by = "cluster_id", k = "meta25", 
-                 bars = TRUE, perc = TRUE)
-plotClusterExprs(sce, k = "meta50", features = "type")
+plotExprHeatmap(sce, features = NULL, 
+                by = "cluster_id", k = "meta10", 
+                bars = TRUE, perc = TRUE, scale = "first")
+plotClusterExprs(sce, k = "meta10", features = NULL)
 
-# Differential analysis 
-# Perform differential abundance analysis
-da_res <- diffcyt::testDA_voom(
-  sce,
-  design = ~condition,      # Design matrix with experimental conditions
-  contrast = c("conditionTreatment - conditionControl")  # Test contrast
-)
-
-# View results
-head(da_res)
-
-# Heatmap 
-CATALYST::plotExprHeatmap(
-  sce,
-  features = "type",   # Show type markers
-  by = "cluster_id",   # Summarize by cluster
-  scale = "last"       # Scale marker expression
-)
+plotMultiHeatmap(sce, 
+                 hm1 = , k = "som25", 
+                 row_anno = FALSE, bars = TRUE, perc = TRUE)
