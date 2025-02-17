@@ -1,0 +1,115 @@
+library(ggplot2)
+library(reshape2)
+library(flowCore)
+library(gridExtra)
+library(flowVS)  
+
+# check transformation 
+# Extract expression data ---
+raw_exprs <- exprs(fs_raw[[1]])  # Extract from raw flowSet
+transformed_exprs <- exprs(fs[[1]])  # Extract from transformed flowSet
+marker_names <- colnames(raw_exprs)  # Get marker names
+
+# Ensure row names exist ---
+rownames(raw_exprs) <- seq_len(nrow(raw_exprs))  # If rownames are NULL, add indices
+rownames(transformed_exprs) <- seq_len(nrow(transformed_exprs))
+
+# Convert data for visualization ---
+# Melt raw data
+raw_df <- melt(
+  cbind(Cell_ID = rownames(raw_exprs), as.data.frame(raw_exprs)),
+  id.vars = "Cell_ID", variable.name = "Marker", value.name = "Value"
+)
+raw_df$Transformation <- "Raw"
+
+# Melt transformed data
+transformed_df <- melt(
+  cbind(Cell_ID = rownames(transformed_exprs), as.data.frame(transformed_exprs)),
+  id.vars = "Cell_ID", variable.name = "Marker", value.name = "Value"
+)
+transformed_df$Transformation <- "Transformed"
+
+# Combine both datasets ---
+comparison_df <- rbind(raw_df, transformed_df)
+
+# Plot distributions ---
+ggplot(comparison_df, aes(x = Value, fill = Transformation)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 50) +
+  facet_wrap(~Marker, scales = "free") +  # One plot per marker
+  theme_minimal() +
+  labs(title = "Comparison of Raw vs Transformed Marker Distributions")
+
+# or 
+# Plot raw data with density plot
+p1 <- ggplot(comparison_df[comparison_df$Transformation == "Raw", ], aes(x = Value)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  facet_wrap(~Marker, scales = "free") +  
+  theme_minimal() +
+  labs(title = "Raw Marker Distributions", x = "Expression", y = "Density")
+
+# Plot transformed data with density plot
+p2 <- ggplot(comparison_df[comparison_df$Transformation == "Transformed", ], aes(x = Value)) +
+  geom_density(fill = "blue", alpha = 0.5) +
+  facet_wrap(~Marker, scales = "free") +  
+  theme_minimal() +
+  labs(title = "Transformed Marker Distributions", x = "Expression", y = "Density")
+
+# Display both plots
+grid.arrange(p1, p2, ncol = 1)
+
+############### BENCHMARK MARKERS #################
+# Define the markers to benchmark
+markers_to_benchmark <- c("FJComp-BV605-A", "FJComp-PE-Dazzle594-A", "FJComp-PE-A")  # Adjust with your markers
+
+# Extract raw expression values from the first FCS file
+raw_exprs <- exprs(fs[[1]])[, markers_to_benchmark]
+
+# Convert to a flowFrame for transformation functions
+ff <- flowFrame(as.matrix(raw_exprs))
+
+# OPTION A : RE-RUN FLOWVS FOR MARKERS OF INTEREST 
+# Estimate variance-stabilizing cofactors
+flowvs_cofactors <- estParamFlowVS(fs, channels = markers_to_benchmark)
+# Display the estimated cofactors
+print(flowvs_cofactors)
+
+# OPTION B : BENCHMARK WITH DEFINED VALUES AND PLOT 
+# Function to benchmark different arcsinh cofactors
+benchmark_arcsinh <- function(raw_exprs, marker, cofactor_range = c(0.5, 1, 5, 10, 50, 75, 100, 500, 1000, 2000)) {
+  
+  # Initialize a list to store transformed values
+  transformed_data <- list()
+  
+  # Loop over each cofactor
+  for (cofactor in cofactor_range) {
+    # Apply arcsinh transformation
+    transformed_data[[as.character(cofactor)]] <- asinh(raw_exprs[, marker] / cofactor)
+  }
+  
+  # Convert raw data for visualization
+  raw_df <- data.frame(Value = raw_exprs[, marker], Transformation = "Raw")
+  
+  # Convert transformed data for visualization
+  transformed_dfs <- lapply(names(transformed_data), function(cofactor) {
+    data.frame(Value = transformed_data[[cofactor]], Transformation = paste("Arcsinh (cofactor =", cofactor, ")"))
+  })
+  
+  # Combine all data
+  all_data <- do.call(rbind, c(list(raw_df), transformed_dfs))
+  
+  # Plot histograms for all cofactors
+  plot <- ggplot(all_data, aes(x = Value, color = Transformation)) +
+    geom_density(size = 1) +  # Use density plot instead of histogram
+    theme_minimal() +
+    ggtitle(paste("Cofactor Benchmarking for", marker)) +
+    facet_wrap(~Transformation, scales = "free") +
+    theme(legend.position = "none")  # Remove legend for clarity
+  
+  # Return the plot
+  return(plot)
+}
+
+# Usage example (adjust marker name accordingly)
+benchmark_arcsinh(raw_exprs, marker = "FJComp-BV605-A")
+benchmark_arcsinh(raw_exprs, marker = "FJComp-PE-Dazzle594-A")
+benchmark_arcsinh(raw_exprs, marker = "FJComp-PE-A")
