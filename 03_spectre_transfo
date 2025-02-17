@@ -1,0 +1,94 @@
+# Load required libraries
+library(flowCore)   # For handling FCS files
+library(Spectre)    # For spectral flow transformation
+library(CATALYST)   # For downstream analysis
+library(ggplot2)       # For visualization
+library(dplyr)         # For data manipulation
+
+# Load raw FCS files (update the path to your FCS folder)
+
+
+# Convert flowSet to a data frame (Spectre requires data frames)
+  df_raw <- do.call(rbind, lapply(sampleNames(fs_raw), function(sample) {
+      data <- exprs(fs_raw[[sample]])  # Extract expression matrix
+     data <- as.data.frame(data)  # Convert to data.frame
+     data$Sample_ID <- sample  # Add sample ID column
+     return(data)
+     }))
+
+# 🔹 Exclude metadata columns (keep only markers)
+marker_names <- colnames(df_raw)[!colnames(df_raw) %in% c("Sample_ID", "Population")]
+
+### 2️⃣ Estimate Optimal Arcsinh Cofactors per Marker
+estimate_arcsinh_cofactor <- function(data, markers) {
+  sapply(markers, function(marker) {
+    marker_sd <- sd(data[[marker]], na.rm = TRUE)  # Compute SD
+    return(max(1, marker_sd / 5))  # Adjust factor (can be fine-tuned)
+  })
+}
+
+# 🔹 Compute best cofactors for all markers
+optimal_cofactors <- estimate_arcsinh_cofactor(df_raw, marker_names)
+
+# 🔹 Print computed cofactors
+print(optimal_cofactors)
+
+### 3️⃣ Apply Arcsinh Transformation using Optimal Cofactors
+df_transformed <- df_raw  # Copy data
+
+for (marker in marker_names) {
+  df_transformed[[marker]] <- asinh(df_raw[[marker]] / optimal_cofactors[marker])
+}
+
+### 4️⃣ Compare Raw vs Transformed Distributions
+# 🔹 Convert to long format (to compare raw vs transformed values)
+df_raw_long <- df_raw %>%
+  pivot_longer(cols = all_of(marker_names), names_to = "Marker", values_to = "Raw") %>%
+  group_by(Sample_ID, Marker) %>%
+  mutate(row_id = row_number())  
+
+df_transformed_long <- df_transformed %>%
+  pivot_longer(cols = all_of(marker_names), names_to = "Marker", values_to = "Transformed") %>%
+  group_by(Sample_ID, Marker) %>%
+  mutate(row_id = row_number())  
+
+# 🔹 Merge raw and transformed data
+comparison_df <- df_raw_long %>%
+  left_join(df_transformed_long, by = c("Sample_ID", "Marker", "row_id"))
+
+### 📌 Plot Raw Data Separately
+p1 <- ggplot(df_raw_long, aes(x = Raw)) +
+  geom_density(color = "blue", fill = "blue", alpha = 0.3) +
+  facet_wrap(~Marker, scales = "free") +
+  theme_minimal() +
+  labs(title = "Raw Marker Distributions", x = "Expression Value", y = "Density")
+
+### 📌 Plot Transformed Data Separately
+p2 <- ggplot(df_transformed_long, aes(x = Transformed)) +
+  geom_density(color = "red", fill = "red", alpha = 0.3) +
+  facet_wrap(~Marker, scales = "free") +
+  theme_minimal() +
+  labs(title = "Transformed Marker Distributions", x = "Expression Value", y = "Density")
+
+# 🔹 Print the plots separately
+print(p1)
+print(p2)
+grid.arrange(p1, p2, ncol = 1)
+
+
+### 5️⃣ Convert to FlowSet for CATALYST
+df_transformed$Sample <- as.factor(df_transformed$Sample)  # Ensure Sample column is a factor
+fs_transformed <- Spectre::convertDataframeToFlowSet(df_transformed, sample.col = "Sample")
+
+### 6️⃣ Create CATALYST SingleCellExperiment (sce) object
+sce <- CATALYST::prepData(
+  x = fs_transformed,
+  md = metadata,    # Metadata table
+  panel = panel,    # Panel information
+  transform = FALSE, # Already transformed
+  assay = "exprs",   # Store in the correct assay
+  truncate_max_range = FALSE
+)
+
+# Print SCE structure
+sce
