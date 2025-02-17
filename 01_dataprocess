@@ -1,4 +1,3 @@
-#selection of markers 
 
 library(flowCore)        # For reading FCS files
 library(CATALYST)        # Main package for mass cytometry preprocessing
@@ -8,45 +7,80 @@ library(clusterExperiment) # Clustering
 library(dplyr)    # Data manipulation
 library(ggplot2)
 library(flowVS) #transformation 
+library(reshape2) # for QC of transformation
+library(clValid) #for dunn score (QC)
 
-setwd("C:/Users/annab/Desktop/Andy/Rash vs NR 2025")
+setwd("C:/Users/annab/Desktop/Andy/Data_Camille")
 
 #Data import 
-files <- list.files("./J0_Rash vs NR sezary/01_data/02_transformed", 
+files <- list.files("./fcs alive", 
                     pattern = "fcs", 
                     full.names = TRUE)
-fs <- read.flowSet(path = "C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/01_data/02_transformed", 
+fs_raw <- read.flowSet(path = "./fcs alive", 
                    pattern = ".fcs", 
                    truncate_max_range = FALSE)
 
 #prepare metadata
 metadata <- data.frame(
-  file_name = basename(files),
-  sample_id = c("NR1", "NR2", "RASH1", "NR3", "NR4", "NR5", "NR6", "NR7", 
-                "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
-                "RASH6", "RASH7", "RASH8"),
-  patient_id = c("NR1", "NR2", "RASH1", "NR3", "NR4", "NR5", "NR6", "NR7", 
-                 "RASH2", "RASH3", "RASH4", "NR8", "NR9", "RASH5", "NR10", 
-                 "RASH6", "RASH7", "RASH8"),
-  condition = c( "NR", "NR", "RASH", "NR", "NR", "NR", "NR", "NR", 
-                 "RASH", "RASH", "RASH", "NR", "NR", "RASH", "NR", 
-                 "RASH", "RASH", "RASH"),
+  file_name = fs@phenoData@data$name,
+  sample_id = c("J07_534", "J07_548", "J10_534", "J10_548", 
+                "J14_534", "J14_548", "J21_534", "J21_548",
+                "J28_534", "J28_548", "J35_534", "J35_548", 
+                "J42_534", "J42_548"),
+  patient_id = c("534", "548", "534", "548", "534", "548", "534", "548", 
+                 "534", "548", "534", "548", "534", "548"),
+  condition = c("J07", "J07", "J10", "J10", 
+                "J14", "J14", "J21", "J21",
+                "J28", "J28", "J35", "J35", 
+                "J42", "J42"),
   stringsAsFactors = FALSE
 )
 
 #import panel used
-panel <- read.csv("C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/cytometry_panel.csv")
-panel_2 <- read.csv("C:/Users/annab/Desktop/Andy/Rash vs NR 2025/J0_Rash vs NR sezary/cytometry_panel_2.csv")
+panel <- read.csv("./ATO_FULLpanel.csv")
 
-# Import the FCS files and create a SingleCellExperiment object
+# Transform 
+## downsample first 
+Downsampling_FlowSet <- function(x, samplesize , replace=TRUE, prob=NULL){
+  if(missing(samplesize))
+    samplesize <- min(flowCore::fsApply(x,nrow))
+  flowCore::fsApply(x, function(ff){
+    i <- sample(nrow(ff), size = samplesize, replace=replace, prob)
+    ff[i,]
+  })
+}
+markerstotransform <- panel$fcs_colname #select markers 
+fs_down <- Downsampling_FlowSet(x=fs_raw, samplesize = 10000) #number of cells included
+cofactors <- estParamFlowVS(fs_down, channels=markerstotransform)
+cofactordata <- data.frame(markerstotransform, cofactors)
+write.csv2(x=cofactordata, file=paste0("./cofactordata.csv"), row.names=F) #csv file
+
+# transform all data
+fcs_transform <- transFlowVS(fs_raw, channels = panel$fcs_colname, cofactordata$cofactors)
+
+#save transformed data 
+write.flowSet(fcs_transform, outdir="./fcs_transfo2",
+              filename = paste0(gsub(".csv", ".fcs", sampleNames(fcs_transform))))
+
+# re-import transformed fcs files 
+files <- list.files("./fcs_transfo2", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs <- read.flowSet(path = "./fcs_transfo2", 
+                   pattern = ".fcs", 
+                   truncate_max_range = FALSE)
+
+
+#Create a SingleCellExperiment object
 sce <- CATALYST::prepData(
   x = fs,
   md = metadata,
-  panel = panel_2,
+  panel = panel,
   transform = FALSE,  # Since the data is pre-transformed
   cofactor = NULL,    # Skip additional transformation
   assay = "exprs",    # Store data in the correct assay
-  truncate_max_range = FALSE
+  truncate_max_range = FALSE, 
+  FACS = TRUE
 )
 
 # Normalization of cells between samples 
@@ -67,25 +101,22 @@ sce <- sce[, cells_to_keep]
 # 4. Vérification
 table(n_cells(sce))
 
-assayNames(sce)[1] <- "exprs"  # Rename counts to exprs
-
-#optional : select high variance markers 
-expr_matrix <- assay(sce, "exprs")  # Extract expression data
-marker_variance <- apply(expr_matrix, 1, var)
-high_var_markers <- sort(marker_variance, decreasing = TRUE)[1:26]
-high_var_markers <- names(sort(marker_variance, decreasing = TRUE)[1:20])  #exclude low variance markers 
-
-#advised : filter markers (retrieve gating markers)
+# option A : filter markers (retrieve gating markers)
 type_markers <- panel$antigen[panel$marker_class == "type"]
-# Exclude CD7, CD26, and TRCB1
-type_markers_filtered <- setdiff(type_markers, c("CD8", "CD7", "CD26", "TRCB1", "CD45", "CCR10"))
 
-#trying smthg else : highvariance markers, but without gating markers 
-highvar_markers_filtered <- setdiff(high_var_markers, c("CD8", "CD7", "CD26", "TRCB1", "CD45", "CCR10"))
+# option B (if needed) : select high variance markers 
+expr_matrix <- assay(sce, "counts")  # Extract expression data
+marker_variance <- apply(expr_matrix, 1, var)
+high_var_markers <- sort(marker_variance, decreasing = TRUE)[1:3]
+high_var_markers <- names(sort(marker_variance, decreasing = TRUE)[1:3])  #exclude low variance markers 
+
 
 set.seed(1234)
-#Dimensionality reduction
-sce <- runDR(sce, "UMAP", cells = 1e5, features = highvar_markers_filtered)
+# Dimensionality reduction
+sce <- runDR(sce, "UMAP", cells = 1e5, features = NULL)
+# might need to rename : 
+assayNames(sce)[assayNames(sce) == "counts"] <- "exprs"
+
 
 ## plot UMAP 
 CATALYST::plotDR(
@@ -99,28 +130,36 @@ CATALYST::plotDR(
 
 # clustering 
 sce <- cluster(sce, 
-               features = highvar_markers_filtered, 
+               features = NULL, 
                xdim = 10, 
                ydim = 10, 
-               maxK = 10, 
+               maxK = 20, 
                seed = 1234) 
 
-CATALYST::plotDR(
-  sce,
-  color_by = "meta10"  # Color by cluster ID
-)
 
-CATALYST::plotDR(
-  sce,
-  color_by = "CCR8"
-)
+CATALYST::plotDR(sce, color_by = "meta15")  # Color by cluster ID
+
+CATALYST::plotDR(sce, color_by = "CD2")
+
+CATALYST::plotDR(sce, "UMAP", color_by = "meta20", facet_by = "condition")
 
 #check clusters expressions 
 plotExprHeatmap(sce, features = NULL, 
-                by = "cluster_id", k = "meta10", 
-                bars = TRUE, perc = TRUE, scale = "first")
-plotClusterExprs(sce, k = "meta10", features = NULL)
+                by = "cluster_id", k = "som100", 
+                bars = TRUE, perc = TRUE, scale = "last")
+plotClusterExprs(sce, k = "meta20", features = NULL)
 
 plotMultiHeatmap(sce, 
-                 hm1 = , k = "som25", 
+                 hm1 = type_markers, k = "meta15",
                  row_anno = FALSE, bars = TRUE, perc = TRUE)
+
+# dunn score (not tested yet)
+dunn_score <- dunn(as.matrix(dist(t(assay(sce, "exprs")))), cluster_ids)
+print(dunn_score)
+
+
+# PCA : Identify markers that contribute heavily to clustering.
+# If certain markers dominate the results, consider normalizing them or down-weighting their influence.
+
+pca_res <- prcomp(t(assay(sce, "exprs")))
+barplot(abs(pca_res$rotation[,1]), main = "PCA Loading - PC1", col = "skyblue")
