@@ -1,0 +1,901 @@
+BiocManager::install(version = "insert package") # To install packages 
+
+library(flowCore)        # For reading FCS files
+library(CATALYST)        # Main package for mass cytometry preprocessing
+library(SingleCellExperiment) # Data handling framework
+# Data manipulation
+library(dplyr)    
+library(tidyr)
+library(readxl)
+library(gridExtra)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+# For transfo 
+library(flowVS)
+library(flowCore)
+library(flowWorkspace)
+# For QC 
+library(PeacoQC)
+library(reshape2) # for QC of transformation
+# For downstream analyses 
+library(diffcyt) # for DA analyses 
+library(lme4) # for ANOVA 
+library(edgeR)
+library(limma)
+library(stats) 
+library(ggstats)
+library(purrr)
+library(broom)
+library(glmmTMB) #for Negative Binomial Model
+library(slingshot) #for trajectoire
+library(DelayedMatrixStats) #for trajectoire
+library(scater) # For visualization
+library(RColorBrewer)
+library(Polychrome)
+library(ggbeeswarm)
+library(broom.helpers)
+
+
+set.seed(1234)
+setwd("") # paste absolute path to your working directory 
+
+# Proposed minimal structure for Working Directory : 
+  # 01_data to store fcs files 
+  # 02_metadata
+
+################################################################################
+############################ TRANSFORMATION ####################################
+################################################################################
+
+### Import Data : define these few objects for further usage
+  # files (vector of raw files)
+  # fs_raw (flowset object) 
+  # fs_down for faster computational process 
+  # df_raw (using fs_down's expression matrix), format for plotting distributions
+files <- list.files("./01_data", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs_raw <- read.flowSet(path = "./01_data", 
+                       pattern = ".fcs", 
+                       truncate_max_range = FALSE)
+
+# Call downsampling function 
+Downsampling_FlowSet <- function(x, samplesize , replace=TRUE, prob=NULL){
+  if(missing(samplesize))
+    samplesize <- min(flowCore::fsApply(x,nrow))
+  flowCore::fsApply(x, function(ff){
+    i <- sample(nrow(ff), size = samplesize, replace=replace, prob)
+    ff[i,]
+  })
+}
+# Downsample for better computational process (especially if data is heavy +++)
+fs_down <- Downsampling_FlowSet(x=fs_raw, samplesize = 10000) # adjust number of cells 
+# Turn fs_down into a dataframe, used for plotting markers' distribution
+df_raw <- do.call(rbind, lapply(sampleNames(fs_down), function(sample) {
+  data <- exprs(fs_down[[sample]])  # Extract expression matrix
+  data <- as.data.frame(data)  # Convert to data.frame
+  data$Sample_ID <- sample  # Add sample ID column
+  return(data)
+}))
+
+
+### Import your panel (xlsx format) : 
+  # Column names are "fcs_colname", "antigen", "marker_class"
+  # marker_class = "type", "state", "none"
+panel <- read_xlsx("./02_metadata/panel.xlsx")
+
+
+### Call this function to visualize transformed distributions
+plot_transformed_distributions <- function(marker_names, cofactors) {
+  df_transformed <- df_raw  # Copy original data
+  for (marker in marker_names) {
+    df_transformed[[marker]] <- asinh(df_raw[[marker]] / cofactors[marker])  # Apply transformation
+  }
+  # Create a named vector of markers with rounded cofactors
+  marker_labels <- paste0(marker_names, " (", sprintf("%.2f", cofactors[marker_names]), ")")
+  names(marker_labels) <- marker_names  # Ensure correct mapping
+  # Convert to long format for ggplot
+  df_long <- df_transformed %>%
+    pivot_longer(cols = all_of(marker_names), names_to = "Marker", values_to = "Transformed") %>%
+    group_by(Sample_ID, Marker) %>%
+    mutate(row_id = row_number())  
+  # Generate and return the ggplot
+  p <- ggplot(df_long, aes(x = Transformed)) +
+    geom_density(color = "red", fill = "red", alpha = 0.3) +
+    facet_wrap(~Marker, scales = "free", labeller = labeller(Marker = marker_labels)) +  # Show rounded cofactor
+    theme_minimal() +
+    labs(title = "Transformed Marker Distributions", x = "Expression Value", y = "Density")
+  print(p)  # Display the plot
+  return(df_long)  # Return the long dataframe in case you need it
+}
+
+################################################################################
+### Transform with FlowVS and manually adapt markers/cofactors of interest #####
+
+### Required objects :
+  # files (vector of raw files)
+  # fs_raw (flowset object)
+  # panel
+  # "plot_transformed_distributions" function
+
+
+# Define markers to transform : here it takes all markers and retrieves technical channels
+markerstotransform <- panel$fcs_colname[!panel$fcs_colname %in% c("Sample_ID", "Time", "Viability")] 
+markerstotransform <- colnames(df_raw)[!colnames(df_raw) %in% c("Sample_ID", "Time", "Viability")] # or do it without the panel csv file
+
+# Apply flowVS algorithm (about 15 min)
+cofactors <- estParamFlowVS(fs_down, channels=markerstotransform) 
+cofactordata <- data.frame(markerstotransform, cofactors) # Create dataframe with results
+
+# Advised : save now flowVS cofactors in a xlsx file to keep note of initial values 
+WriteXLS::WriteXLS(x=cofactordata, "./02_metadata/cofactordata_flowvs.xlsx") 
+
+### Plotting FlowVS initial results 
+# Transform into a named vector for plotting with "plot_transformed_distributions" function
+optimal_cofactors <- setNames(cofactordata$cofactors, cofactordata$markerstotransform)
+# Apply function to display transformed distributions
+df_transformed_all <- plot_transformed_distributions(markerstotransform, optimal_cofactors)
+
+### Manually fine-tune markers after automatic FlowVS process 
+### How to use this loop ### 
+  # First run all markers with different dividing factor values to see which one is better
+  # FlowVS ? Or manual cofactor using different dividing_factor = 1, 5, 10, 15, 20, 30, 50 ? 
+  # Once you know the right combination cofactor/sd divider for each marker : 
+  # Run the look for MOI <- c("A", "B", "C"), dividing_factor = 10 ; replace values in cofactordata
+  # Then run it for MOI <- c("D", "E"), dividing_factor = 20 ; replace values in cofactordata
+  # etc... 
+# In the end : cofactordata should contain flowvs values, and manual selected cofactors for MOI 
+# Save final csv/xlsx file
+
+### Step 1 : Spot the channels you want to fine-tune and plot it :
+# You can optionally run firstly all markers to see the difference bet. flowvs vs manual
+markers_oi <- markerstotransform # all markers
+# Then select markers of interest that you need to tune for a given dividing factor
+markers_oi <- c("FJComp-BV605-A", "FJComp-PE-Cy5-A", "FJComp-PE-Dazzle594-A")
+
+# Create and adapt function to estimate cofactor 
+estimate_arcsinh_cofactor <- function(data, markers) {
+  sapply(markers, function(marker) {
+    marker_sd <- sd(data[[marker]], na.rm = TRUE)  # Compute SD
+    return(max(1, marker_sd / 5))  # KEY VARIABLE : Adjust dividing factor (need to be tuned : from 1 to 50 for example)
+  })
+}
+# Apply estimation to markers of interest 
+optimal_cofactors_moi <- estimate_arcsinh_cofactor(df_raw, markers_oi)
+print(optimal_cofactors_moi) # print values
+# Plot transformed distributions to check results 
+df_transformed_moi <- plot_transformed_distributions(markers_oi, optimal_cofactors_moi)
+
+### Step 2 : Combine flowVS and manual cofactors = replace values of MOI in cofactordata object
+# Convert values into dataframe before merging
+cofactordata_moi <- data.frame(markerstotransform = names(optimal_cofactors_moi), 
+                               cofactors = as.numeric(optimal_cofactors_moi))
+# Insert and replace these values in "cofactordata" object
+cofactordata$cofactors[cofactordata$markerstotransform %in% cofactordata_moi$markerstotransform] <- 
+  cofactordata_moi$cofactors[match(cofactordata$markerstotransform[cofactordata$markerstotransform %in% cofactordata_moi$markerstotransform], 
+                                   cofactordata_moi$markerstotransform)]
+
+# Once process is done (= cofactordata contains flowVS values + fine-tuned cofactors) :
+# Check cofactors values
+print(cofactordata)
+# Save cofactors as an xlsx file
+WriteXLS::WriteXLS(x=cofactordata, "./02_metadata/cofactordata_tuned.xlsx")
+
+### Step 3 : Apply transformation and save 
+# Transform all data
+fs_transformed <- transFlowVS(fs_raw, channels = panel$fcs_colname, cofactordata$cofactors)
+# Save transformed data 
+write.flowSet(fs_transformed, outdir="./01_data/fcs_transfo",
+              filename = paste0(gsub(".csv", ".fcs", sampleNames(fs_transformed))))
+
+################################################################################
+### Import saved file ##########################################################
+
+# If you want to come back to this step (after transfo - before QC) : 
+# Import transformed fcs files if saved 
+files <- list.files("./01_data/fcs_transfo", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs_transformed <- read.flowSet(path = "./01_data/fcs_transfo", 
+                               pattern = ".fcs", 
+                               truncate_max_range = FALSE)
+
+# Or Import cofactors to replot transfos
+cofactordata <- read_xlsx("./02_metadata/cofactordata_flowvs.xlsx")
+cofactordata <- read_xlsx("./02_metadata/cofactordata_tuned.xlsx")
+# Replot the transfos, using these objects : 
+  # fs_raw 
+  # df_raw 
+optimal_cofactors_tuned <- setNames(cofactordata$cofactors,
+                                    cofactordata$markerstotransform)
+df_transformed_tuned <- plot_transformed_distributions(cofactordata$markerstotransform, optimal_cofactors_tuned)
+
+
+################################################################################
+############################ QUALITY CONTROL ###################################
+################################################################################
+
+### After Transfo : QC using PeacoQC package ###
+### Required objects :
+   # files (transformed)
+files <- list.files("./01_data/fcs_transfo", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+
+### Step 1 : call QC function 
+# Option A : Standard function to process QC for each FCS file if cell count is sufficient
+process_fcs_file <- function(fcs_file) {
+  fcs_data <- read.FCS(fcs_file, truncate_max_range = FALSE)  # Load FCS file
+  all_channels <- colnames(exprs(fcs_data))  
+  scatter_channels <- c("FSC-A", "FSC-H", "FSC-W", "SSC-A", "SSC-H", "SSC-W")  
+  fluorescence_channels <- setdiff(all_channels, scatter_channels)  
+  qc_results <- PeacoQC(fcs_data, channels = fluorescence_channels,
+                        determine_good_cells = "all",
+                        MAD = 6,  
+                        IT_limit = 0.55,
+                        min_cells = 150, 
+                        max_bins = 500,
+                        save_fcs = TRUE)
+  return(qc_results$FinalFF)  # Return cleaned flowFrame
+}
+
+# Option B if data is really poor (<1500 cells) : Replace low cells files with initial fcs file 
+# Call modified QC function 
+process_fcs_file <- function(fcs_file) {
+  fcs_data <- read.FCS(fcs_file, truncate_max_range = FALSE)
+  all_channels <- colnames(exprs(fcs_data))
+  scatter_channels <- c("FSC-A", "FSC-H", "FSC-W", "SSC-A", "SSC-H", "SSC-W")
+  fluorescence_channels <- setdiff(all_channels, scatter_channels)
+  # Run PeacoQC
+  qc_results <- tryCatch(
+    PeacoQC(fcs_data,
+            channels = fluorescence_channels,
+            determine_good_cells = "all",
+            MAD = 6,
+            IT_limit = 0.55,
+            min_cells = 150,
+            max_bins = 500,
+            save_fcs = TRUE),
+    error = function(e) {
+      message("PeacoQC failed on ", fcs_file, " -- skipping.")
+      return(NULL)
+    }
+  )
+  # If PeacoQC has erased the whole file : save raw file instead of cleaned file 
+  if (is.null(qc_results) || nrow(exprs(qc_results$FinalFF)) == 0) {
+    message("Restoring original data for ", fcs_file)
+    # Add a Original_ID column to the raw file using the add_column_to_ff function (see below)
+    ff_with_id <- add_column_to_flowFrame(fcs_data, "Original_ID", seq_len(nrow(fcs_data)))
+    # Change the name of the file (add "_QC")
+    qc_dir <- "./PeacoQC_results/fcs_files/"
+    if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
+    out_filename <- paste0(tools::file_path_sans_ext(basename(fcs_file)), "_QC.fcs")
+    out_path <- file.path(qc_dir, out_filename)
+    # Save file in the right outpath 
+    write.FCS(ff_with_id, filename = out_path)
+    return(ff_with_id)
+  }
+  return(qc_results$FinalFF)
+}
+# Call another function to add the Original_ID column to the initial ff (aim is to fake PeacoQC's process)
+add_column_to_flowFrame <- function(ff, colname, values) {
+  stopifnot(nrow(exprs(ff)) == length(values))
+  new_exprs <- cbind(exprs(ff), values)
+  colnames(new_exprs)[ncol(new_exprs)] <- colname
+  # Create empty parameter with the right structure
+  new_row <- data.frame(
+    name = colname,
+    desc = colname,
+    range = max(values) - min(values) + 1,
+    minRange = min(values),
+    maxRange = max(values),
+    row.names = colname,
+    stringsAsFactors = FALSE
+  )
+  # Add new parameter to existing ones 
+  old_params <- parameters(ff)
+  new_params_df <- rbind(pData(old_params), new_row)
+  new_params <- AnnotatedDataFrame(data = new_params_df)
+  # Rebuild flowframe 
+  new_ff <- flowFrame(exprs = new_exprs,
+                      parameters = new_params,
+                      description = description(ff))
+  return(new_ff)
+}
+
+### Step 2 : Process all FCS files and store results in a named list
+cleaned_flowframes <- setNames(
+  lapply(files, process_fcs_file),  # Process each FCS file
+  gsub("\\.fcs$", "", basename(files))  # Remove extra ".fcs" and assign original filenames
+)
+
+### Step 3 : Convert to flowSet 
+fs_cleaned <- flowSet(cleaned_flowframes)
+print(colnames(fs_cleaned[[1]])) # check columns 
+# Remove technical channels : PeacoQC creates an "Original_ID" column
+fs_cleaned <- fsApply(fs_cleaned, function(ff) ff[, setdiff(colnames(ff), c("Time", "Original_ID"))])
+
+### Step 4 : Save file 
+# Output of PeacoQC automatically stores clean fcs and report in a new folder "./PeacoQC_results"
+# Save RData :
+save(fs_cleaned, file = "./01_data/fs_cleaned.RData")
+
+################################################################################
+### Import saved files #########################################################
+
+# If you want come back to this step (after transfo and QC) : 
+# Either directly import saved RData 
+load("./01_data/fs_cleaned.RData")
+
+# Or import transformed and cleaned fcs files 
+files <- list.files("./PeacoQC_results/fcs_files", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs_cleaned <- read.flowSet(path = "./PeacoQC_results/fcs_files", 
+                           pattern = ".fcs", 
+                           truncate_max_range = FALSE)
+# Make sure you remove technical channels 
+print(colnames(fs_cleaned[[1]]))  
+fs_cleaned <- fsApply(fs_cleaned, function(ff) ff[, setdiff(colnames(ff), c("Time", "Original_ID"))])
+# And make sure to clean names (erase "_QC.fcs") and change them in the fs object
+print(sampleNames(fs_cleaned))
+sample_names <- basename(sampleNames(fs_cleaned)) # ex: export_XXX_QC.fcs
+sample_names <- sub("_QC\\.fcs$", "", sample_names)
+sampleNames(fs_cleaned) <- sample_names
+
+
+################################################################################
+######################## Batch Effect Correction ###############################
+################################################################################
+
+#The next step is to correct batch effects, we will use the Cytonorm package to align our different files from different batches. We measured the same samples on different days (technical replicates) 
+
+# Set direction of cleaned PeacoQC fcs files 
+fcs.dir<- file.path("C:/Users/Camille/Desktop/T/PeacoQC_results/fcs_files")
+files <- list.files(fcs.dir, pattern = "fcs")
+# Import
+train_files <- file.path(fcs.dir, list.files(fcs.dir, pattern="export_HD PBMC_"))
+validation_files <- file.path(fcs.dir, list.files(fcs.dir, pattern="export_T"))
+fsom <- prepareFlowSOM(train_files, colsToUse = markerstotransform, transformList = NULL, FlowSOM.params = list(xdim=10,ydim=10, nClus=20, scale=FALSE))
+
+#To check if clustering is appropriate:
+cvs <- testCV(fsom)
+#If the clusters are impacted by batch effects, CV values of >1.5/2 will occur, than you can also choose to put FlowSOM.params to NULL and skip clustering.
+#Next, load a metadata file which includes at least a sample_id and a column defining the batches. You can include a column with filenames. 
+
+md <-read_excel("C:/Users/Camille/Desktop/T/T_Cytonorm.xlsx")
+md$Type <- c("1" = "Train", "2" = "Validation")[md$Type]
+train_data <- dplyr::filter(md, Type == "Train")
+validation_data <- dplyr::filter(md, Type == "Validation")
+
+model <- CytoNorm.train(files = train_data$Path,
+                        labels = train_data$Batch,
+                        channels = markerstotransform,
+                        transformList = NULL,
+                        FlowSOM.params = list(nCells = 6000, 
+                                              xdim = 5,
+                                              ydim = 5,
+                                              nClus = 10,
+                                              scale = FALSE),
+                        normMethod.train = QuantileNorm.train,
+                        normParams = list(nQ = 101,
+                                          goal = "mean"),
+                        seed = 1,
+                        verbose = TRUE)
+
+CytoNorm.normalize(model = model,
+                   files = validation_data$Path,
+                   labels = validation_data$Batch,
+                   transformList = NULL,
+                   transformList.reverse = NULL,
+                   normMethod.normalize = QuantileNorm.normalize,
+                   outputDir = "Cytonorm",
+                   prefix = "Norm_",
+                   clean = TRUE,
+                   verbose = TRUE)
+
+outdir <- file.path("C:/Users/Camille/Desktop/T/Cytonorm")
+fcs_norm <- read.flowSet(path=outdir, pattern="*Norm_export", transformation = FALSE, truncate_max_range = FALSE)
+
+
+pdf(("C:/Users/Camille/Desktop/T/Cytonorm/densityplot.pdf"), width=12)
+densityplot(~., fs_raw[[9]],fill="lightblue",theme="simpleTheme") #before transformation
+densityplot(~., fs_cleaned[[9]],fill="lightblue") #before normalization
+densityplot(~., fcs_norm[[9]],fill="lightblue")#after normalization
+dev.off()
+
+################################################################################
+############################# CATALYST Pipeline ################################
+################################################################################
+
+################################################################################
+### Prepare metadata ###########################################################
+
+# Import xlsx with the following columns : "file_name", "sample_id", "patient_id", "condition"
+  # file_name must not contain ".fcs" 
+metadata <- read_xlsx("./02_metadata/conditions.xlsx")
+
+# Import panel used (only markers, no technical channels)
+  # columns are : fcs_colname, antigen, marker_class
+panel <- read_xlsx("./02_metadata/panel.xlsx")
+
+################################################################################
+### Create a SingleCellExperiment object #######################################
+
+### Required objects :
+  # fs_cleaned (flowset object)
+  # Warning : files must be cleaned from : 
+    # Technical channels (Time, Original_ID) 
+    # Filenames suffix : "_QC.fcs" 
+
+### Create sce object 
+sce <- CATALYST::prepData(
+  x = fs_cleaned,
+  md = metadata,
+  panel = panel,
+  transform = FALSE,  # Since the data is pre-transformed
+  cofactor = NULL,    # Skip additional transformation
+  truncate_max_range = FALSE, 
+  FACS = TRUE
+)
+
+################################################################################
+### Normalization of cells between samples #####################################
+# Check cell count for each sample
+table(n_cells(sce))
+# Plot cell count for each sample
+plotCounts(sce, group_by = "sample_id", color_by = "condition")
+
+## Downsample to the smallest sample 
+# 1. Choose the number of cells (by default, using the smallest sample)
+n_cells_to_keep <- min(n_cells(sce))
+# 2. Apply downsampling for each sample 
+cells_to_keep <- unlist(lapply(unique(sce$sample_id), function(sample) {
+  # extract each sample's number of cells 
+  sample_cells <- which(sce$sample_id == sample)
+  # Random downsampling to the minimum
+  sample(sample_cells, size = n_cells_to_keep, replace = FALSE)
+}))
+# 3. Filter cells to have the same size for each sample
+sce <- sce[, cells_to_keep]
+# 4. Check results 
+table(n_cells(sce))
+
+################################################################################
+### Dimensionality Reduction + Clustering ######################################
+# Prepare object : 
+assayNames(sce)[assayNames(sce) == "counts"] <- "exprs"
+
+### Compute DR 
+# Downsample as desired to fasten computational process 
+# Selected markers can be used for DR in features ; NULL = all markers by default ; "type"/"state"
+sce <- runDR(sce, "UMAP", cells = 1e6, features = NULL)
+
+#### Compute Clustering : default algorithm is FlowSOM + ConsensusClusterPlus
+# Fine tune x/ydim for granularity (5 for rough precision, 10 for overclustering)
+# maxK is to set up an upperlimit of metaclusters
+sce <- CATALYST::cluster(sce, 
+                         features = NULL, 
+                         xdim = 10,
+                         ydim = 10, 
+                         maxK = 15)
+
+# Help to optimize clustering parameters : 
+# Estimate the right number of metaclusters using delta area plot (equivalent of scRNAseq's elbow method)
+delta_area(sce)
+
+################################################################################
+### Visualization ##############################################################
+
+### General function to generate a PDF ### 
+pdf("nameofthepdf.pdf", width = 7, height = 7) #adapt size of the pdf 
+# copy-paste the plotDR/hm function 
+dev.off()
+
+### General overview of data ###
+# PCA 
+clrDR(sce, by = "sample_id", k = "meta15")
+# MDS 
+pbMDS (sce, color_by = "condition", label_by = "condition")
+
+
+### Plot DR/ UMAP using basic metadata ###
+CATALYST::plotDR(sce, color_by = "condition") # Color cells by experimental condition
+CATALYST::plotDR(sce, color_by = "sample_id") # Color cells by sample id 
+
+# Plot DR by markers 
+CATALYST::plotDR(sce, color_by = "CD3")
+CATALYST::plotDR(sce, color_by = "CD45RA")
+
+CATALYST::plotDR(sce, color_by = "CD7")
+CATALYST::plotDR(sce, color_by = "CD8")
+CATALYST::plotDR(sce, color_by = "CD38")
+CATALYST::plotDR(sce, color_by = "CD16")
+CATALYST::plotDR(sce, color_by = "CD56")
+CATALYST::plotDR(sce, color_by = "CD197")
+CATALYST::plotDR(sce, color_by = "CCR4")
+CATALYST::plotDR(sce, color_by = "CXCR3")
+CATALYST::plotDR(sce, color_by = "CD57")
+CATALYST::plotDR(sce, color_by = "PD1")
+CATALYST::plotDR(sce, color_by = "CCR8")
+
+# Plot DR by clustering results
+CATALYST::plotDR(sce, color_by = "som100")  # Color by cluster ID (som25/100 depending on x/ydim)
+CATALYST::plotDR(sce, color_by = "meta15")  # Color by metacluster ID
+
+# Plot DR using multiple parameters 
+CATALYST::plotDR(sce,
+                 color_by = "meta15", # overlay by cluster/metacluster/marker
+                 facet_by = "condition") # metadata option = condition/sample_id
+
+# Display clusters expressions 
+  # Choose somX / metaY
+# "last" = scaling applied after clustering 
+  # Highlights relative differences between clusters/samples.
+  # Less useful if markers have vastly different ranges, 
+  # => If goal is to compare clusters while keeping relative marker differences
+# "first" = scale first then aggregate 
+  # Scale markers before aggregation, reducing the impact of extreme values.
+  # More useful if you want each marker to contribute equally, regardless of its raw range.
+  # => If goal is to compare marker expression within each cluster
+plotExprHeatmap(sce, features = NULL, 
+                by = "cluster_id", k = "som25", 
+                bars = TRUE, perc = TRUE, scale = "last") 
+plotExprHeatmap(sce, features = NULL, 
+                by = "cluster_id", k = "meta12", 
+                bars = TRUE, perc = TRUE, scale = "last") 
+
+plotClusterExprs(sce, k = "som25", features = NULL)
+
+plotMultiHeatmap(sce, 
+                 hm1 = "type", hm2 = "state", 
+                 k = "meta12",
+                 row_anno = FALSE, bars = TRUE, perc = TRUE)
+plotMultiHeatmap(sce, 
+                 hm1 = "type", 
+                 k = "meta12",
+                 row_anno = FALSE, bars = TRUE, perc = TRUE)
+
+
+plotPbExprs(sce, 
+            k = "merging",
+            features = "state",
+            facet_by = "antigen",
+            color_by = "condition",
+            shape_by = NULL,
+            size_by = FALSE,
+            geom = c("both", "points", "boxes"),
+            ncol = NULL)
+
+plotFreqHeatmap(sce,
+                k = "meta12")
+
+################################################################################
+### Annotation #################################################################
+
+# Merging process : 
+  # option A : annotate each clusters if flowSOM grid is small (ex : xdim x ydim = som25)
+  # option B : annotate metaclusters (kmax) in case of greater flowSOM grid resolution (som100)
+# 1st step : create xlsx w/ column A = clusters ; column B = populations
+# 2nd step : import, and create dataframe 
+# 3rd step : merge 
+
+# Option A : merge with clusters
+clusters_merging <- "./02_metadata/cluster_merging.xlsx"    #import xlsx
+clusters_merging <- read_excel(clusters_merging) 
+data.frame(clusters_merging)  #create df 
+sce <- CATALYST::mergeClusters(sce, k = "som25", #merge with sce 
+                               table = clusters_merging, id = "merging")
+# Option B : merge with metaclusters 
+mc_merging <- "./02_metadata/mc_merging.xlsx"
+mc_merging <- read_excel(mc_merging)
+data.frame(mc_merging)
+sce <- CATALYST::mergeClusters(sce, k = "meta15", #option B 
+                               table = mc_merging, id = "merging")
+
+# Results : View corresponding clusters - metaclusters 
+sce@metadata$cluster_codes
+
+# Set up and order = factorize your clusters for a potential logical order 
+sce@metadata[["cluster_codes"]][["merging"]] <- 
+  factor(sce@metadata[["cluster_codes"]][["merging"]], 
+         levels = c("mc1", "mc3", "mc1"))
+
+plotExprHeatmap(sce, features = "state", 
+                by = "cluster_id", k = "merging", 
+                bars = TRUE, perc = TRUE, scale = "last") 
+
+plotMultiHeatmap(sce, 
+                 hm1 = "state", k = "merging",
+                 row_anno = FALSE, bars = TRUE, perc = TRUE)
+
+################################################################################
+################################ STATISTICS ####################################
+################################################################################
+
+# export frequence for each cluster (in function of sample_id)
+p <- plotAbundances(sce, k = "merging", by = "cluster_id")
+abundance_per_cluster <- p[["data"]]
+p1 <- plotAbundances(sce, k = "merging", by = "sample_id")
+abundance_per_cluster_per_sample <- p1[["data"]]
+
+write.csv(abundance_per_cluster, "abundance_per_cluster.csv")
+write.csv(abundance_per_cluster, "abundance_per_cluster_per_sample.csv")
+
+plotAbundances(sce, k = "merging", by = "cluster_id")
+plotAbundances(sce, k = "merging", by = "sample_id")
+
+# Function to plot Volcanoplot from table of results 
+plot_volcano <- function(results_table, logFC_threshold = 1, p_adj_threshold = 0.05) {
+  # Convert to data frame if necessary
+  df <- as.data.frame(results_table)
+  
+  # Define significance based on thresholds
+  df$Significant <- ifelse(df$p_adj < p_adj_threshold & abs(df$logFC) > logFC_threshold, "Significant", "Not Significant")
+  # Create volcano plot
+  p <- ggplot(df, aes(x = logFC, y = -log10(p_adj), color = Significant, label = cluster_id)) +
+    geom_point(size = 3) +  # Scatter points
+    scale_color_manual(values = c("Significant" = "red", "Not Significant" = "gray")) +
+    geom_text_repel(data = subset(df, Significant == "Significant"), size = 5) +  # Label significant points
+    theme_minimal() +
+    labs(title = "Volcano Plot - Differential Abundance",
+         x = "Log Fold Change (logFC)",
+         y = "-log10 Adjusted P-Value (p_adj)") +
+    theme(legend.position = "top") +
+    geom_vline(xintercept = c(-logFC_threshold, logFC_threshold), linetype = "dashed", color = "black") +  # LogFC threshold
+    geom_hline(yintercept = -log10(p_adj_threshold), linetype = "dashed", color = "black")  # p_adj threshold
+  # Return plot
+  return(p)
+}
+
+# Define your exp infos (=metadata)
+experiment_info = data.frame(group_id = metadata$condition, 
+                             patient_id = metadata$patient_id, 
+                             sample_id = metadata$sample_id)
+
+# Factorize your conditions : control - condition 1 - condition 2 etc.
+experiment_info$group_id <- factor(experiment_info$group_id, 
+                                   levels = c("DS", "PT"))
+
+experiment_info$group_id <- factor(experiment_info$group_id, 
+                                   levels = c("DS", "NR", "CR"))
+
+design <- createDesignMatrix(experiment_info, cols_design = "group_id")
+
+# Define the comparison 
+contrast <- createContrast(c(0, 1))  # Tests PT vs DS
+
+contrast <- createContrast(c(0, 1, 1))  # Tests patients vs DS
+contrast <- createContrast(c(0, 1, 0))  # Tests NR vs DS
+contrast <- createContrast(c(0, 0, 1))  # Tests CR vs DS
+contrast <- createContrast(c(0, 1, -1))  # Tests NR vs CR
+
+# Differential Abundancies 
+res_DA <- diffcyt(
+  d_input = sce,    
+  clustering_to_use = "merging",
+  design = design,     
+  contrast = contrast,        
+  analysis_type = "DA",       
+  method_DA = "diffcyt-DA-edgeR"
+)
+tbl_DA <- rowData(res_DA$res) # Extract table of results 
+# Plot VP 
+plot_volcano(tbl_DA, logFC_threshold = 0.5, p_adj_threshold = 0.05)
+
+# Differential States 
+res_DS <- diffcyt(
+  d_input = sce,  
+  clustering_to_use = "merging",
+  design = design,     
+  contrast = contrast,        
+  analysis_type = "DS",       
+  method_DS = "diffcyt-DS-limma"
+)
+tbl_DS <- rowData(res_DS$res)
+# Plot VP 
+plot_volcano(tbl_DS, logFC_threshold = 0.5, p_adj_threshold = 0.05)
+
+
+# Other ways to display results 
+plotDiffHeatmap(sce, tbl_DA, all = TRUE, fdr = 0.05, sort_by = "lfc", 
+                col_anno = c("condition"), lfc = 1, normalize = TRUE, row_anno = T)
+plotDiffHeatmap(sce, tbl_DS, all = TRUE, fdr = 0.05, sort_by = "lfc", 
+                col_anno = c("condition"), lfc = 1, normalize = TRUE, row_anno = T)
+
+
+### Regression lineaire frequence - clinical factors
+# Re-import the abundance_per_cluster.csv file where you added the clinical factors that you wanna test.
+abundance_per_cluster_v2 <- read_delim("02_metadata/abundance_per_cluster_v2.csv", 
+                                       delim = ";", escape_double = FALSE, trim_ws = TRUE)
+df <- data.frame(abundance_per_cluster_v2)
+# Add the different levels of each of your factors for the character type
+df$condition <- factor(df$condition, 
+                       levels = c("AA", "GG"))
+df$cluster_id <- factor(df$cluster_id, levels = c("TSP", "ETP", "DN(P)", "DP(P)", "DP(Q)", "CD8aa", "CD8 selected", "CD8 matures", "CD4 selected", "CD4 matures", "Treg(diff)", "Treg", "TCRgd+"))
+df$Sexe <- factor(df$Sexe, levels = c("F","M"))
+df$sample_id <- factor(df$sample_id, levels = c("T87","T109","T116","T124","T129","T132","T146","T150","T153", "T166","T169","T63","T72","T74","T123","T125","T137","T144","T147","T154","T160","T167"))
+
+
+## 1- Test to see if frequency of populations(frequency per cluster_id) are depending of the age of the patient
+# Apply a linear model for each combination of cluster_id
+lm_results <- df %>%
+  group_by(cluster_id) %>%
+  group_split() %>%  # Split the data into a list of subgroups here : cluster_id (can be coupled with other variable if needed)
+  map_df(~ {
+    model <- lm(Freq ~ Log10, data = .)  # Apply model : here it tests if the Freq of each cluster_id depends on Log10(name of the age column) : that is the age log10-transformed
+    tidy_model <- tidy(model)  # Extract values
+    tidy_model$p_value <- tidy_model$p.value[tidy_model$term == "Log10"]  
+    tidy_model$cluster_id <- unique(.$cluster_id)  
+    
+    return(tidy_model)
+  })
+
+# Keep only results associated with Log10 (the slope)
+lm_results <- lm_results %>%
+  filter(term == "Log10", p.value < 0.05)
+
+print(lm_results)
+
+
+
+# Graph to represent this data : Frequency of each population in function of the Age and the condition
+ggplot(df, aes(x = Log10, y = Freq, color = condition)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, aes(color = condition)) +  # Add linear regression slope / here in fucntion of the condition
+  facet_wrap(~ cluster_id, scales = "free_y") +  # Facet par cluster_id
+  labs(title = "Fréquence pour chaque Cluster fonction de l'age et du SNP",
+       x = "Age (log10)", y = "Fréquence",
+       color = "Condition") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Improve readability of labels on the X axis
+  theme_minimal()  # Thème minimal pour un graphique épuré
+  
+  
+  ## 2- Test to see if frequency of populations are depending of the sexe of the patient
+  
+  # Perform the statistical test (t-test or Wilcoxon test) for each cluster_id
+  test_results <- df %>%
+  group_by(cluster_id) %>%
+  summarise(
+    p_value = t.test(Freq ~ Sexe)$p.value,  # Student's t-test to compare means according to the Sexe
+    .groups = "drop"
+  )
+
+# Add a column for annotation of significant p-values
+test_results <- test_results %>%
+  mutate(significance = ifelse(p_value < 0.05, "*", "ns"))  # "ns" = non significatif, "*" = significatif
+
+ggplot(df, aes(x = Sexe, y = Freq, color = Sexe)) +
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +  
+  geom_jitter(width = 0.2, alpha = 0.6) +  
+  facet_wrap(~ cluster_id, scales = "free_y") +  
+  labs(x = "Sexe", y = "Fréquence", color = "Sexe") +  # Labels
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  stat_summary(fun = "mean", geom = "point", shape = 18, size = 3, color = "black") +  
+  # Add the average in points
+  # Add the significance annotations
+  geom_text(data = test_results, 
+            aes(x = 1.5, y = max(df$Freq) + 2, label = significance), 
+            inherit.aes = FALSE, size = 5, color = "red", fontface = "bold")
+
+
+
+
+## 3- More complex model to investigate the effect of clinical factors 
+
+#Create a subset dataframe containning the cluster to be tested be filtering on cluster_id
+df_CD4 = subset(df, cluster_id == "CD4 matures")
+
+#Apply the glm containing the variable that we wanna test in the model. You can choose which variable to input into the model depending on the previous tests.
+mod <- glm(
+  Freq ~ Log10 +Sexe + condition ,
+  family = "quasipoisson",
+  data = df_CD4
+)
+
+ggcoef_model(mod)
+
+
+
+################################################################################
+################################ TRAJECTOIRE ###################################
+################################################################################
+
+# Add merging information in colData
+sce$merged_flowsom <- cluster_ids(sce, "merging")
+
+#Check if everything is well renamed
+colData(sce)
+
+#Optional : factorize the populations order as you wish
+colData(sce)$merged_flowsom<- factor(colData(sce)$merged_flowsom, levels = c("CD34+", "DN(P)", "DP(P)","DP(Q)","T(agonist)","CD8aa","CD8","CD8 matures","CD4","CD4 matures","Treg","TCRgd+"))
+
+# Create a new SCE without NAs in UMAP 
+sce_sling <- filterSCE(sce, complete.cases(reducedDim(sce)))
+plotDR(sce_sling, "UMAP", color_by = "merged_flowsom")
+
+#Create slingshot object and run slingshot
+sce_sling <- slingshot(sce_sling,clusterLabels = "merged_flowsom", reducedDim='UMAP', start.clus="TSP")
+head(sce_sling$slingPseudotime_1)
+head(sce_sling$slingPseudotime_2)
+head(sce_sling$slingPseudotime_3)
+
+slingPseudotime(sce_sling, na = FALSE)
+
+# plot results of lineage found in the data
+plot(reducedDim(sce_sling, "UMAP"), col = sce_sling$merged_flowsom, pch = 8)
+lines(SlingshotDataSet(sce_sling), lwd = 2, type = 'lineages', col = "black")# legende à ajouter
+legend("bottomleft",  # Position of the legend on the plot (can be adjusted)
+       legend = unique(sce_sling$merged_flowsom),# Labels of the clusters
+       fill = unique(sce_sling$merged_flowsom),
+       title = "Clusters",  # Title of the legend
+       cex = 0.8,  # Size of the text in the legend
+       border = "black")  
+#Plot pseudotime according to lineage
+ggplot(as.data.frame(reducedDim(sce_sling, "UMAP")), 
+       aes(x = UMAP1, y = UMAP2, color = sce_sling$slingPseudotime_5))+ 
+  # you can vary the Pseudotime here to do all lineages
+  geom_point() +
+  scale_color_viridis_c() +
+  theme_minimal()
+
+
+#Plot des pseudotimes des différents types cellulaires
+UMAP_df <- data.frame(UMAP1 = reducedDim(sce_sling,"UMAP")[,1],
+                      UMAP2 = reducedDim(sce_sling,"UMAP")[,2],
+                      cell_type = sce_sling$merged_flowsom)
+clusterorder <- factor(sce_sling$merged_flowsom, 
+                       levels = c("CD34+", "DN(P)", "DP(P)","DP(Q)","T(agonist)",
+                                  "CD8aa","CD8","CD8 matures","CD4","CD4 matures","Treg","TCRgd+"))
+
+#Pseudotime by cluster by lineage
+ggplot(UMAP_df, aes(x=sce_sling$slingPseudotime_3, y = clusterorder, 
+                    colour = sce_sling$merged_flowsom))+
+  geom_quasirandom(groupOnX = FALSE) + theme_classic() +
+  xlab("PseudoTime") + ylab("Cell Type") +
+  ggtitle("Cells ordered by UMAP Pseudotime") 
+
+
+#PseudoTime by cluster by condition by lineage
+p1 <- ggplot(UMAP_df, aes(x = sce_sling$slingPseudotime_5, y = clusterorder, 
+                          colour = sce_sling$merged_flowsom)) + facet_wrap(sce_sling@colData@listData[["condition"]])+
+  geom_quasirandom(groupOnX = FALSE) + theme_classic() +
+  xlab("First Slingshot pseudotime") + ylab("Cell Type") +
+  ggtitle("Cells ordered by Slingshot pseudotime")
+
+#Creates the pseudo-time dataframes depending of the cluster and of your  condition
+Pseudotemps <- data.frame(
+  pseudotime1 = sce_sling$slingPseudotime_1,
+  pseudotime2 = sce_sling$slingPseudotime_2,
+  pseudotime3 = sce_sling$slingPseudotime_3,
+  pseudotime4 = sce_sling$slingPseudotime_4,
+  pseudotime5 = sce_sling$slingPseudotime_5,
+  merged_flowsom = sce_sling$merged_flowsom,
+  condition = sce_sling@colData@listData[["condition"]])
+
+#Retrieve data based on our condition
+AA <- split(Pseudotemps, f = Pseudotemps$condition)
+histAA = data.frame(AA[["AA"]])
+histGG = data.frame(AA[["GG"]])
+
+#Color palette to be adapted to our number of clusters
+c17 <- c( "#A5A3F2", "#9F7CD5","#6408DF","#2BEFF5","#0E18EC",
+          "#FFA533","#FF4F33","#FCCA12","#FCFC12","#E3A4E8","#EC0E0E","#C41DD2")
+
+# Histogram counts as a function of pseudotime
+GG <- ggplot(histGG, aes(pseudotime1, fill = merged_flowsom ,color = merged_flowsom))  +
+  geom_histogram( binwidth = 0.5, alpha = 0.8,  position="identity") + scale_color_manual(values= c17) + scale_fill_manual(values= c17)
+
+
+GG + theme(
+  plot.background = element_rect(fill = "white"),
+  panel.background = element_rect(fill = "white"),
+  axis.line.x = element_line(color = "grey"),
+  axis.line.y = element_line(color = "grey")
+)
+
+# Save slingshot coordinates and RData 
+write.csv(Pseudotemps,file="Pseudotemps_slingshot.csv")
+saveRDS(sce_sling,"sce_sling.rds")
