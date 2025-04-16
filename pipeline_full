@@ -352,58 +352,68 @@ sampleNames(fs_cleaned) <- sample_names
 #The next step is to correct batch effects, we will use the Cytonorm package to align our different files from different batches. We measured the same samples on different days (technical replicates) 
 
 # Set direction of cleaned PeacoQC fcs files 
-fcs.dir<- file.path("C:/Users/Camille/Desktop/T/PeacoQC_results/fcs_files")
-files <- list.files(fcs.dir, pattern = "fcs")
-# Import
-train_files <- file.path(fcs.dir, list.files(fcs.dir, pattern="export_HD PBMC_"))
-validation_files <- file.path(fcs.dir, list.files(fcs.dir, pattern="export_T"))
-fsom <- prepareFlowSOM(train_files, colsToUse = markerstotransform, transformList = NULL, FlowSOM.params = list(xdim=10,ydim=10, nClus=20, scale=FALSE))
+input_dir <- "./PeacoQC_results/fcs_files"         # Cleaned .fcs 
+output_dir <- "./CytoNorm_results/fcs_files"       # Normalized files output
 
-#To check if clustering is appropriate:
-cvs <- testCV(fsom)
-#If the clusters are impacted by batch effects, CV values of >1.5/2 will occur, than you can also choose to put FlowSOM.params to NULL and skip clustering.
-#Next, load a metadata file which includes at least a sample_id and a column defining the batches. You can include a column with filenames. 
+files <- list.files(input_dir, pattern = "\\.fcs$", full.names = TRUE)
+fs <- read.flowSet(files, truncate_max_range = FALSE)
 
-md <-read_excel("C:/Users/Camille/Desktop/T/T_Cytonorm.xlsx")
-md$Type <- c("1" = "Train", "2" = "Validation")[md$Type]
-train_data <- dplyr::filter(md, Type == "Train")
-validation_data <- dplyr::filter(md, Type == "Validation")
+# Import metadata about batchs info 
+  # For example, you can add a column "batch" to your metadata (B1, B2 etc) 
+metadata_batchs <- read_xlsx("./02_metadata/batchs.xlsx")
+# filter the control (here we use DS) subset of fs with metadata 
+  # If you want to mix up conditions to create your model, add a new column to your xlsx with a chosen label
+metadata_ctrl <- metadata_batchs %>% filter(condition == "DS")
+fs_ctrl <- fs[basename(pData(fs)$name) %in% metadata_ctrl$file_name]
 
-model <- CytoNorm.train(files = train_data$Path,
-                        labels = train_data$Batch,
-                        channels = markerstotransform,
-                        transformList = NULL,
-                        FlowSOM.params = list(nCells = 6000, 
-                                              xdim = 5,
-                                              ydim = 5,
-                                              nClus = 10,
-                                              scale = FALSE),
-                        normMethod.train = QuantileNorm.train,
-                        normParams = list(nQ = 101,
-                                          goal = "mean"),
-                        seed = 1,
-                        verbose = TRUE)
+# Define markers to normalize 
+channels_to_normalize <- setdiff(colnames(fs[[1]]), c("Time", "Original_ID"))
 
-CytoNorm.normalize(model = model,
-                   files = validation_data$Path,
-                   labels = validation_data$Batch,
-                   transformList = NULL,
-                   transformList.reverse = NULL,
-                   normMethod.normalize = QuantileNorm.normalize,
-                   outputDir = "Cytonorm",
-                   prefix = "Norm_",
-                   clean = TRUE,
-                   verbose = TRUE)
+# Train model 
+model <- CytoNorm::CytoNorm.train(
+  files = files[basename(files) %in% metadata_ctrl$file_name],
+  labels = metadata_ctrl$batch,
+  channels = channels_to_normalize,
+  transformList = NULL,
+  normParams = list(nQ = 99),
+  FlowSOM.params = list(
+    xdim = 15, ydim = 15, nClus = 10,
+    scale = FALSE, nCells = 1e+08),
+  seed = 1234,
+  outputDir = output_dir
+)
 
-outdir <- file.path("C:/Users/Camille/Desktop/T/Cytonorm")
-fcs_norm <- read.flowSet(path=outdir, pattern="*Norm_export", transformation = FALSE, truncate_max_range = FALSE)
+# Check the CVs 
+CVs1 <- CytoNorm::testCV(fsom = model$fsom, cluster_values = 3:20, plot = FALSE)
+CytoNorm::PlotOverviewCV(fsom = model$fsom, cv_res = CVs1, show_cv = 0.8, max_cv = 1.5)
 
+# Apply model to all files 
+CytoNorm::CytoNorm.normalize(
+  files = files,
+  labels = metadata_batchs$batch, #referring to "batch" column of metadata
+  model = model,
+  transformList = NULL,
+  transformList.reverse = NULL,
+  outputDir = output_dir
+)
 
-pdf(("C:/Users/Camille/Desktop/T/Cytonorm/densityplot.pdf"), width=12)
-densityplot(~., fs_raw[[9]],fill="lightblue",theme="simpleTheme") #before transformation
-densityplot(~., fs_cleaned[[9]],fill="lightblue") #before normalization
-densityplot(~., fcs_norm[[9]],fill="lightblue")#after normalization
-dev.off()
+# Import transformed/cleaned and batch-corrected fcs files 
+files <- list.files("./CytoNorm_results/fcs_files", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs_corrected <- read.flowSet(path = "./CytoNorm_results/fcs_files", 
+                           pattern = ".fcs", 
+                           truncate_max_range = FALSE)
+# Make sure you remove technical channels 
+print(colnames(fs_corrected[[1]]))  
+fs_corrected <- fsApply(fs_corrected, function(ff) ff[, setdiff(colnames(ff), 
+        c("Time", "Original_ID"))])
+# And make sure to clean names (erase prefix "Norm_" and suffix "_QC.fcs") and change them in the fs object
+print(sampleNames(fs_corrected))
+sample_names <- basename(sampleNames(fs_corrected)) # ex: export_XXX_QC.fcs
+sample_names <- sub("^Norm_", "", sample_names)
+sample_names <- sub("_QC\\.fcs$", "", sample_names)
+sampleNames(fs_corrected) <- sample_names
 
 ################################################################################
 ############################# CATALYST Pipeline ################################
@@ -430,6 +440,16 @@ panel <- read_xlsx("./02_metadata/panel.xlsx")
     # Filenames suffix : "_QC.fcs" 
 
 ### Create sce object 
+sce <- CATALYST::prepData(
+  x = fs_corrected,
+  md = metadata,
+  panel = panel,
+  transform = FALSE,  # Since the data is pre-transformed
+  cofactor = NULL,    # Skip additional transformation
+  truncate_max_range = FALSE, 
+  FACS = TRUE
+)
+
 sce <- CATALYST::prepData(
   x = fs_cleaned,
   md = metadata,
@@ -479,7 +499,7 @@ sce <- CATALYST::cluster(sce,
                          features = NULL, 
                          xdim = 10,
                          ydim = 10, 
-                         maxK = 15)
+                         maxK = 20)
 
 # Help to optimize clustering parameters : 
 # Estimate the right number of metaclusters using delta area plot (equivalent of scRNAseq's elbow method)
@@ -489,36 +509,32 @@ delta_area(sce)
 ### Visualization ##############################################################
 
 ### General function to generate a PDF ### 
-pdf("nameofthepdf.pdf", width = 7, height = 7) #adapt size of the pdf 
+pdf("./03_plots/withoutBC.pdf", width = 10, height = 10) #adapt size of the pdf 
+pdf("./03_plots/afterBC.pdf", width = 10, height = 10)
 # copy-paste the plotDR/hm function 
 dev.off()
 
 ### General overview of data ###
 # PCA 
-clrDR(sce, by = "sample_id", k = "meta15")
+clrDR(sce, by = "sample_id", k = "meta20", label_by = "sample_id")
 # MDS 
-pbMDS (sce, color_by = "condition", label_by = "condition")
+pbMDS (sce, color_by = "condition", label_by = "sample_id")
 
 
 ### Plot DR/ UMAP using basic metadata ###
 CATALYST::plotDR(sce, color_by = "condition") # Color cells by experimental condition
 CATALYST::plotDR(sce, color_by = "sample_id") # Color cells by sample id 
+CATALYST::plotDR(sce, color_by = "meta5") 
+CATALYST::plotDR(sce, color_by = "meta5", facet_by = "condition") # Color cells by sample id 
 
 # Plot DR by markers 
-CATALYST::plotDR(sce, color_by = "CD3")
 CATALYST::plotDR(sce, color_by = "CD45RA")
-
-CATALYST::plotDR(sce, color_by = "CD7")
-CATALYST::plotDR(sce, color_by = "CD8")
-CATALYST::plotDR(sce, color_by = "CD38")
-CATALYST::plotDR(sce, color_by = "CD16")
-CATALYST::plotDR(sce, color_by = "CD56")
-CATALYST::plotDR(sce, color_by = "CD197")
-CATALYST::plotDR(sce, color_by = "CCR4")
-CATALYST::plotDR(sce, color_by = "CXCR3")
-CATALYST::plotDR(sce, color_by = "CD57")
-CATALYST::plotDR(sce, color_by = "PD1")
-CATALYST::plotDR(sce, color_by = "CCR8")
+CATALYST::plotDR(sce, color_by = "CD45RO")
+CATALYST::plotDR(sce, color_by = "CCR7")
+CATALYST::plotDR(sce, color_by = "CCR4", facet_by = "condition")
+CATALYST::plotDR(sce, color_by = "CXCR3", facet_by = "condition")
+CATALYST::plotDR(sce, color_by = "CD57", facet_by = "condition")
+CATALYST::plotDR(sce, color_by = "CD274 (PD-L1)")
 
 # Plot DR by clustering results
 CATALYST::plotDR(sce, color_by = "som100")  # Color by cluster ID (som25/100 depending on x/ydim)
@@ -540,27 +556,29 @@ CATALYST::plotDR(sce,
   # More useful if you want each marker to contribute equally, regardless of its raw range.
   # => If goal is to compare marker expression within each cluster
 plotExprHeatmap(sce, features = NULL, 
-                by = "cluster_id", k = "som25", 
+                by = "cluster_id", k = "som100", 
                 bars = TRUE, perc = TRUE, scale = "last") 
 plotExprHeatmap(sce, features = NULL, 
-                by = "cluster_id", k = "meta12", 
+                by = "cluster_id", k = "meta15", 
                 bars = TRUE, perc = TRUE, scale = "last") 
 
 plotClusterExprs(sce, k = "som25", features = NULL)
 
 plotMultiHeatmap(sce, 
                  hm1 = "type", hm2 = "state", 
-                 k = "meta12",
-                 row_anno = FALSE, bars = TRUE, perc = TRUE)
+                 k = "meta15",
+                 row_anno = FALSE, bars = TRUE, perc = TRUE, 
+                 scale = "never")
 plotMultiHeatmap(sce, 
-                 hm1 = "type", 
-                 k = "meta12",
-                 row_anno = FALSE, bars = TRUE, perc = TRUE)
+                 hm1 = NULL, 
+                 k = "meta15",
+                 row_anno = FALSE, bars = TRUE, perc = TRUE,
+                 scale = "last")
 
 
 plotPbExprs(sce, 
-            k = "merging",
-            features = "state",
+            k = "meta15",
+            features = NULL,
             facet_by = "antigen",
             color_by = "condition",
             shape_by = NULL,
@@ -569,7 +587,7 @@ plotPbExprs(sce,
             ncol = NULL)
 
 plotFreqHeatmap(sce,
-                k = "meta12")
+                k = "meta15")
 
 ################################################################################
 ### Annotation #################################################################
@@ -626,11 +644,22 @@ write.csv(abundance_per_cluster, "abundance_per_cluster_per_sample.csv")
 plotAbundances(sce, k = "merging", by = "cluster_id")
 plotAbundances(sce, k = "merging", by = "sample_id")
 
+# Same but with metaX
+p <- plotAbundances(sce, k = "meta15", by = "cluster_id")
+abundance_per_cluster <- p[["data"]]
+p1 <- plotAbundances(sce, k = "meta15", by = "sample_id")
+abundance_per_cluster_per_sample <- p1[["data"]]
+
+write.csv(abundance_per_cluster, "abundance_per_cluster.csv")
+write.csv(abundance_per_cluster, "abundance_per_cluster_per_sample.csv")
+
+plotAbundances(sce, k = "meta15", by = "cluster_id")
+plotAbundances(sce, k = "meta15", by = "sample_id")
+
 # Function to plot Volcanoplot from table of results 
 plot_volcano <- function(results_table, logFC_threshold = 1, p_adj_threshold = 0.05) {
   # Convert to data frame if necessary
   df <- as.data.frame(results_table)
-  
   # Define significance based on thresholds
   df$Significant <- ifelse(df$p_adj < p_adj_threshold & abs(df$logFC) > logFC_threshold, "Significant", "Not Significant")
   # Create volcano plot
@@ -646,6 +675,31 @@ plot_volcano <- function(results_table, logFC_threshold = 1, p_adj_threshold = 0
     geom_vline(xintercept = c(-logFC_threshold, logFC_threshold), linetype = "dashed", color = "black") +  # LogFC threshold
     geom_hline(yintercept = -log10(p_adj_threshold), linetype = "dashed", color = "black")  # p_adj threshold
   # Return plot
+  return(p)
+}
+
+plot_volcano_DS <- function(results_table, logFC_threshold = 1, p_adj_threshold = 0.05) {
+  # Convert to data frame if needed
+  df <- as.data.frame(results_table)
+  # Create combined label for cluster and marker
+  df$label <- paste0("mc", df$cluster_id, "-", df$marker_id)
+  # Define significance
+  df$Significant <- ifelse(df$p_adj < p_adj_threshold & abs(df$logFC) > logFC_threshold,
+                           "Significant", "Not Significant")
+  # Build volcano plot
+  p <- ggplot(df, aes(x = logFC, y = -log10(p_adj), color = Significant, label = label)) +
+    geom_point(size = 2.5) +
+    scale_color_manual(values = c("Significant" = "red", "Not Significant" = "gray")) +
+    geom_text_repel(data = subset(df, Significant == "Significant"), size = 3.5, max.overlaps = 25) +
+    theme_minimal() +
+    labs(title = "Volcano Plot - Differential State (DS)",
+         x = "Log Fold Change (logFC)",
+         y = "-log10 Adjusted P-Value (p_adj)") +
+    theme(legend.position = "top") +
+    geom_vline(xintercept = c(-logFC_threshold, logFC_threshold),
+               linetype = "dashed", color = "black") +
+    geom_hline(yintercept = -log10(p_adj_threshold),
+               linetype = "dashed", color = "black")
   return(p)
 }
 
@@ -666,15 +720,15 @@ design <- createDesignMatrix(experiment_info, cols_design = "group_id")
 # Define the comparison 
 contrast <- createContrast(c(0, 1))  # Tests PT vs DS
 
-contrast <- createContrast(c(0, 1, 1))  # Tests patients vs DS
+contrast <- createContrast(c(0, 0.5, 0.5))  # Tests patients vs DS
 contrast <- createContrast(c(0, 1, 0))  # Tests NR vs DS
 contrast <- createContrast(c(0, 0, 1))  # Tests CR vs DS
-contrast <- createContrast(c(0, 1, -1))  # Tests NR vs CR
+contrast <- createContrast(c(0, -1, 1))  # Tests CR vs NR
 
 # Differential Abundancies 
 res_DA <- diffcyt(
   d_input = sce,    
-  clustering_to_use = "merging",
+  clustering_to_use = "meta15",
   design = design,     
   contrast = contrast,        
   analysis_type = "DA",       
@@ -682,12 +736,12 @@ res_DA <- diffcyt(
 )
 tbl_DA <- rowData(res_DA$res) # Extract table of results 
 # Plot VP 
-plot_volcano(tbl_DA, logFC_threshold = 0.5, p_adj_threshold = 0.05)
+plot_volcano(tbl_DA, logFC_threshold = 1, p_adj_threshold = 0.05)
 
 # Differential States 
 res_DS <- diffcyt(
   d_input = sce,  
-  clustering_to_use = "merging",
+  clustering_to_use = "meta15",
   design = design,     
   contrast = contrast,        
   analysis_type = "DS",       
@@ -695,7 +749,7 @@ res_DS <- diffcyt(
 )
 tbl_DS <- rowData(res_DS$res)
 # Plot VP 
-plot_volcano(tbl_DS, logFC_threshold = 0.5, p_adj_threshold = 0.05)
+plot_volcano_DS(tbl_DS, logFC_threshold = 0.5, p_adj_threshold = 0.05)
 
 
 # Other ways to display results 
@@ -835,7 +889,7 @@ legend("bottomleft",  # Position of the legend on the plot (can be adjusted)
        border = "black")  
 #Plot pseudotime according to lineage
 ggplot(as.data.frame(reducedDim(sce_sling, "UMAP")), 
-       aes(x = UMAP1, y = UMAP2, color = sce_sling$slingPseudotime_5))+ 
+       aes(x = UMAP1, y = UMAP2, color = sce_sling$slingPseudotime_1))+ 
   # you can vary the Pseudotime here to do all lineages
   geom_point() +
   scale_color_viridis_c() +
