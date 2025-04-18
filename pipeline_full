@@ -48,19 +48,7 @@ setwd("") # paste absolute path to your working directory
 ############################ TRANSFORMATION ####################################
 ################################################################################
 
-### Import Data : define these few objects for further usage
-  # files (vector of raw files)
-  # fs_raw (flowset object) 
-  # fs_down for faster computational process 
-  # df_raw (using fs_down's expression matrix), format for plotting distributions
-files <- list.files("./01_data", 
-                    pattern = "fcs", 
-                    full.names = TRUE)
-fs_raw <- read.flowSet(path = "./01_data", 
-                       pattern = ".fcs", 
-                       truncate_max_range = FALSE)
-
-# Call downsampling function 
+### Call Downsampling function 
 Downsampling_FlowSet <- function(x, samplesize , replace=TRUE, prob=NULL){
   if(missing(samplesize))
     samplesize <- min(flowCore::fsApply(x,nrow))
@@ -69,9 +57,20 @@ Downsampling_FlowSet <- function(x, samplesize , replace=TRUE, prob=NULL){
     ff[i,]
   })
 }
+
+# Import Data : define 3 objects for further usage
+  # files (vector of raw files)
+  # fs_raw (flowset object) & fs_down 
+  # df_raw (using fs_down's expression matrix)
+files <- list.files("./01_data", 
+                    pattern = "fcs", 
+                    full.names = TRUE)
+fs_raw <- read.flowSet(path = "./01_data", 
+                       pattern = ".fcs", 
+                       truncate_max_range = FALSE)
 # Downsample for better computational process (especially if data is heavy +++)
-fs_down <- Downsampling_FlowSet(x=fs_raw, samplesize = 10000) # adjust number of cells 
-# Turn fs_down into a dataframe, used for plotting markers' distribution
+fs_down <- Downsampling_FlowSet(x=fs_raw, samplesize = 10e6) # adjust number of cells 
+
 df_raw <- do.call(rbind, lapply(sampleNames(fs_down), function(sample) {
   data <- exprs(fs_down[[sample]])  # Extract expression matrix
   data <- as.data.frame(data)  # Convert to data.frame
@@ -79,14 +78,12 @@ df_raw <- do.call(rbind, lapply(sampleNames(fs_down), function(sample) {
   return(data)
 }))
 
-
-### Import your panel (xlsx format) : 
+# Import Panel (xlsx format) : 
   # Column names are "fcs_colname", "antigen", "marker_class"
   # marker_class = "type", "state", "none"
 panel <- read_xlsx("./02_metadata/panel.xlsx")
 
-
-### Call this function to visualize transformed distributions
+# Call this function to visualize transformed distributions
 plot_transformed_distributions <- function(marker_names, cofactors) {
   df_transformed <- df_raw  # Copy original data
   for (marker in marker_names) {
@@ -115,7 +112,7 @@ plot_transformed_distributions <- function(marker_names, cofactors) {
 
 ### Required objects :
   # files (vector of raw files)
-  # fs_raw (flowset object)
+  # fs_down (flowset object)
   # panel
   # "plot_transformed_distributions" function
 
@@ -124,7 +121,7 @@ plot_transformed_distributions <- function(marker_names, cofactors) {
 markerstotransform <- panel$fcs_colname[!panel$fcs_colname %in% c("Sample_ID", "Time", "Viability")] 
 markerstotransform <- colnames(df_raw)[!colnames(df_raw) %in% c("Sample_ID", "Time", "Viability")] # or do it without the panel csv file
 
-# Apply flowVS algorithm (about 15 min)
+# Apply flowVS algorithm using fs_down (about 1-2 min per marker) 
 cofactors <- estParamFlowVS(fs_down, channels=markerstotransform) 
 cofactordata <- data.frame(markerstotransform, cofactors) # Create dataframe with results
 
